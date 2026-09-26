@@ -232,9 +232,21 @@ def _pool_serves_endpoint(pool: Any, provider: Optional[str], base_url: Optional
     entries = entries_fn()
     return not isinstance(entries, list) or any(_entry_serves_endpoint(entry, base_url) for entry in entries)
 
+def _is_bare_custom_with_key(requested_provider: Optional[str], api_key: Any) -> bool:
+    return isinstance(api_key, str) and bool(api_key.strip()) and str(requested_provider or "").strip().lower() in (
+        "", "custom")
+
+def _custom_pool_key(base_url: Optional[str], requested_provider: Optional[str], api_key: Any) -> Optional[str]:
+    """Pool key of a ``custom`` runtime: by name for a named identity; for a bare one, the pool its
+    own key can own or holds as a row (never a same-URL sibling's), by URL alone when it has none."""
+    from agent.credential_pool import custom_pool_keys_for_owner_key, get_custom_provider_pool_key
+    if _is_bare_custom_with_key(requested_provider, api_key):
+        return next(iter(custom_pool_keys_for_owner_key(base_url, api_key)), None)
+    return get_custom_provider_pool_key(base_url, provider_name=requested_provider)
+
 def _resolve_child_credential_pool(
     effective_provider: Optional[str], parent_agent, effective_base_url: Optional[str] = None,
-    effective_requested_provider: Optional[str] = None,
+    effective_requested_provider: Optional[str] = None, effective_api_key: Any = None,
 ):
     """Credential pool for the child: parent's pool (same provider), that provider's own pool, or None (child keeps
     its fixed credential). Custom endpoints all collapse to ``provider="custom"``, so they are matched by endpoint
@@ -250,7 +262,8 @@ def _resolve_child_credential_pool(
 
     Named custom providers may share one gateway URL with different credentials, so the inherited
     ``requested_provider`` identity takes precedence over URL-only matching (#45763): the child must not
-    lease the first pool registered for the shared endpoint.
+    lease the first pool registered for the shared endpoint. A bare ``custom`` child (and parent) with a key of its
+    own leases only a pool that key can own, never a same-URL sibling's.
     """
     parent_pool = getattr(parent_agent, "_credential_pool", None)
     if not effective_provider:
@@ -258,12 +271,21 @@ def _resolve_child_credential_pool(
     parent_provider = getattr(parent_agent, "provider", None) or ""
     try:
         if effective_provider == "custom":
-            from agent.credential_pool import get_custom_provider_pool_key
-            child_key = get_custom_provider_pool_key(effective_base_url, provider_name=effective_requested_provider)
+            if (parent_pool is not None and parent_provider == "custom"
+                    and _is_bare_custom_with_key(effective_requested_provider, effective_api_key)
+                    and str(getattr(parent_pool, "provider", "") or "").strip().lower() not in ("", "custom")):
+                from agent.credential_pool import credential_pool_matches_provider
+                # The parent's configured-entry pool, when the child's key can be its entry's credential
+                # or is one of its rows (a rotation onto a `hermes auth add` row); a sibling's is refused.
+                if credential_pool_matches_provider(parent_pool, "custom", base_url=effective_base_url,
+                                                    owner_api_key=effective_api_key):
+                    return parent_pool
+            child_key = _custom_pool_key(effective_base_url, effective_requested_provider, effective_api_key)
             if child_key is None:
                 return None
-            parent_key = get_custom_provider_pool_key(
-                getattr(parent_agent, "base_url", None), provider_name=getattr(parent_agent, "requested_provider", None),
+            parent_key = _custom_pool_key(
+                getattr(parent_agent, "base_url", None), getattr(parent_agent, "requested_provider", None),
+                getattr(parent_agent, "api_key", None),
             )
             if parent_pool is not None and parent_provider == "custom" and parent_key is not None and parent_key == child_key:
                 return parent_pool

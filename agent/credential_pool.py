@@ -596,41 +596,172 @@ def _get_custom_provider_config(pool_key: str) -> Optional[Dict[str, Any]]:
     return next((entry for norm_name, entry in _iter_custom_providers() if norm_name == suffix), None)
 
 
-def _custom_provider_declares_other_credential(cp_config: Optional[Dict[str, Any]], api_key: str) -> bool:
-    """True when a ``providers:``/``custom_providers:`` entry's own credential is NOT ``api_key``.
+def _custom_entry_declared_credential(cp_config: Dict[str, Any]) -> Optional[str]:
+    """The credential a ``providers:``/``custom_providers:`` entry declares for itself.
 
-    ``key_cmd`` mints its own token, a literal ``api_key`` counts when it differs, and
-    ``key_env``/``api_key_env`` counts when the variable is unset or holds a different value.
-    An entry with no credential, or whose credential resolves to ``api_key`` (``hermes model``
-    writes ``model.api_key: ${VAR}`` beside an entry with ``key_env: VAR``), can share it."""
-    if not cp_config:
-        return False
+    ``None`` when it declares none; ``""`` when it declares one no runtime key can equal (``key_cmd``
+    mints its own token, a ``key_env``/``api_key_env`` variable is unset); else the literal
+    ``api_key`` or the value of its key variable (``hermes model`` writes ``model.api_key: ${VAR}``
+    beside an entry with ``key_env: VAR``)."""
     if str(cp_config.get("key_cmd") or "").strip():
-        return True
+        return ""
     own = str(cp_config.get("api_key") or "").strip()
+    if own:
+        return own
     env_var = str(cp_config.get("key_env") or cp_config.get("api_key_env") or "").strip()
-    if not own and env_var:
-        own = str(get_env_prefer_dotenv(env_var) or "").strip()
-        if not own:
-            return True
-    return bool(own) and own != api_key
+    if env_var:
+        return str(get_env_prefer_dotenv(env_var) or "").strip()
+    return None
+
+
+def _stored_pool_rows(pool_key: str) -> List[PooledCredential]:
+    """The persisted rows of pool ``pool_key`` (read-only: no seeding, no write-back)."""
+    rows = []
+    for payload in read_credential_pool(pool_key):
+        if isinstance(payload, dict):
+            try:
+                rows.append(PooledCredential.from_dict(pool_key, payload))
+            except Exception:
+                continue
+    return rows
+
+
+def _pool_holds_key(pool_or_provider: Any, api_key: str) -> bool:
+    """Whether ``api_key`` is one of this pool's rows; a pool known only by name (or by a row of it)
+    is read from disk. A ``model_config`` row is no evidence of ownership: it was seeded where the
+    ownership order below put the model's key, and an earlier version may have put it in a
+    sibling's pool."""
+    entries_fn = getattr(pool_or_provider, "entries", None)
+    try:
+        if callable(entries_fn):
+            items = list(entries_fn())
+        else:
+            name = pool_or_provider if isinstance(pool_or_provider, str) else getattr(pool_or_provider, "provider", None)
+            if not isinstance(name, str) or not name.strip():
+                return False
+            items = _stored_pool_rows(name.strip().lower())
+    except Exception:
+        return False
+    return any(
+        getattr(item, "source", None) != "model_config"
+        and api_key in (getattr(item, "runtime_api_key", None), getattr(item, "access_token", None))
+        for item in items
+    )
 
 
 def custom_provider_pool_key_candidates_for_key(base_url: Optional[str], api_key: str) -> List[str]:
-    """Pool keys of the first custom entry on ``base_url`` whose credential can be ``api_key``.
+    """Pool keys of the custom entry on ``base_url`` that owns ``api_key``.
 
     ``custom_provider_pool_key_candidates(base_url)`` picks the first entry on the URL, which
     may be a named sibling holding a DIFFERENT key; the bare-``custom`` main model must neither
-    seed its key into that pool nor resolve from it.
+    seed its key into that pool nor resolve from it. Ownership, strongest first, each tier in
+    config order:
+
+    1. an entry whose own declared credential is the key;
+    2. an entry whose pool holds the key as a row (a ``hermes auth add`` key, the row a rotation
+       moved onto), its holding pools first;
+    3. only then an entry that declares no credential (#100413: the model's key goes to it when
+       nothing better owns it).
+
+    An entry declaring a different credential owns the key only through tier 2.
     """
     normalized_url = _norm_url(base_url)
-    if not normalized_url:
+    key = str(api_key or "").strip()
+    if not normalized_url or not key:
         return []
-    for norm_name, entry in _iter_custom_providers():
-        if (_norm_url(entry.get("base_url")) == normalized_url
-                and not _custom_provider_declares_other_credential(entry, api_key)):
+    entries = [
+        (norm_name, entry) for norm_name, entry in _iter_custom_providers()
+        if _norm_url(entry.get("base_url")) == normalized_url
+    ]
+    for norm_name, entry in entries:
+        if _custom_entry_declared_credential(entry) == key:
+            return _pool_keys_for_custom_entry(norm_name, entry)
+    for norm_name, entry in entries:
+        pool_keys = _pool_keys_for_custom_entry(norm_name, entry)
+        held = [pool_key for pool_key in pool_keys if _pool_holds_key(pool_key, key)]
+        if held:
+            return held + [pool_key for pool_key in pool_keys if pool_key not in held]
+    for norm_name, entry in entries:
+        if _custom_entry_declared_credential(entry) is None:
             return _pool_keys_for_custom_entry(norm_name, entry)
     return []
+
+
+def _owner_key(owner_api_key: Any) -> str:
+    """A runtime's own key as an owner: the stripped string, or "" (None, empty, or the callable of
+    a ``key_cmd`` runtime)."""
+    return owner_api_key.strip() if isinstance(owner_api_key, str) else ""
+
+
+def custom_pool_keys_for_owner_key(base_url: Optional[str], api_key: Any) -> List[str]:
+    """Pool keys a bare-``custom`` runtime holding ``api_key`` owns on ``base_url``, in the
+    ownership order of ``custom_provider_pool_key_candidates_for_key``; none without a string key.
+    A sibling that neither declares the key nor holds it as a row is named only when it declares
+    no credential and nothing better owns the key."""
+    owner_key = _owner_key(api_key)
+    return custom_provider_pool_key_candidates_for_key(base_url, owner_key) if owner_key else []
+
+
+def _same_url_custom_pool_keys(base_url: Optional[str]) -> set:
+    """Pool keys of the configured ``providers:``/``custom_providers:`` entries on ``base_url``."""
+    runtime_url = _norm_url(base_url)
+    return {
+        key
+        for norm_name, entry in _iter_custom_providers()
+        if runtime_url and _norm_url(entry.get("base_url")) == runtime_url
+        for key in _pool_keys_for_custom_entry(norm_name, entry)
+    }
+
+
+def _custom_pool_serves_owner_key(pool_or_provider: Any, pool_provider: str, base_url: Optional[str],
+                                  owner_api_key: str, url_match: bool) -> bool:
+    """Owner-aware ``custom`` match: a same-URL entry's pool belongs to the runtime only when the
+    runtime's own key can be that entry's credential, or is one of the pool's own rows.
+
+    A pool that is no configured entry on the URL has nothing to tell apart by key and keeps the
+    URL-only verdict."""
+    if pool_provider not in _same_url_custom_pool_keys(base_url):
+        return url_match
+    owned = {str(key).strip().lower() for key in custom_provider_pool_key_candidates_for_key(base_url, owner_api_key)}
+    return pool_provider in owned or _pool_holds_key(pool_or_provider, owner_api_key)
+
+
+def _configured_bare_custom_key(base_url: Optional[str]) -> str:
+    """``model.api_key`` of a bare-``custom`` ``model:`` block on ``base_url`` (the key the resolver
+    matched the model's pool with), else ""."""
+    config = _load_config_safe()
+    model_cfg = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(model_cfg, dict) or not _norm_url(base_url):
+        return ""
+    if str(model_cfg.get("provider") or "").strip().lower() not in ("", "auto", "custom"):
+        return ""
+    if _norm_url(model_cfg.get("base_url")) != _norm_url(base_url):
+        return ""
+    return next((v.strip() for v in (model_cfg.get("api_key"), model_cfg.get("api")) if isinstance(v, str) and v.strip()), "")
+
+
+def custom_pool_pin_serves_primary(pool_or_provider: Any, provider: Optional[str], base_url: Optional[str],
+                                   owner_api_key: Any = None) -> bool:
+    """Whether a bare-``custom`` primary may go back to the pool it recorded running from.
+
+    Only a pool scoped to a configured entry on ``base_url`` qualifies (never plain ``custom``, which
+    may hold rows of other endpoints), and only while it holds or can own the primary's key or the
+    key its ``model:`` block configures on that URL: a ``hermes auth remove`` of the row the primary
+    was on leaves it the pool of the entry that declares the configured key."""
+    if str(provider or "").strip().lower() != "custom":
+        return False
+    raw = pool_or_provider if isinstance(pool_or_provider, str) else getattr(pool_or_provider, "provider", None)
+    pool_key = raw.strip().lower() if isinstance(raw, str) else ""
+    try:
+        if not pool_key or pool_key not in _same_url_custom_pool_keys(base_url):
+            return False
+        return any(
+            credential_pool_matches_provider(pool_or_provider, "custom", base_url=base_url, owner_api_key=key)
+            for key in dict.fromkeys((_owner_key(owner_api_key), _configured_bare_custom_key(base_url)))
+            if key
+        )
+    except Exception:
+        return False
 
 
 def get_pool_strategy(provider: str) -> str:
@@ -717,6 +848,7 @@ def credential_pool_matches_provider(
     provider: Optional[str],
     *,
     base_url: Optional[str] = None,
+    owner_api_key: Any = None,
 ) -> bool:
     """Return whether a pool belongs to the requested runtime provider.
 
@@ -727,6 +859,12 @@ def credential_pool_matches_provider(
     runtime endpoint belongs to the same configured custom provider. Empty
     identities fail closed. Legacy pool adapters without a ``provider``
     attribute remain compatible; production pools are scoped.
+
+    A bare ``custom`` runtime is matched by URL alone, which accepts the pool of the FIRST entry on
+    the URL even when that is a named sibling holding a different key. ``owner_api_key`` (the
+    runtime's own key, when the caller knows it) narrows the match to the pools that key can own:
+    the entry whose credential can be the key, or a pool holding it as a row. An empty or
+    non-string key (a ``key_cmd`` callable) keeps the URL-only match.
     """
     raw_pool_provider = getattr(pool_or_provider, "provider", None)
     if raw_pool_provider is None:
@@ -739,27 +877,34 @@ def credential_pool_matches_provider(
     provider_norm = str(provider or "").strip().lower()
     if not pool_provider or not provider_norm:
         return False
+    owner_key = _owner_key(owner_api_key) if provider_norm == "custom" else ""
     if not pool_provider.startswith(CUSTOM_POOL_PREFIX):
         if pool_provider == provider_norm:
             return True
-        return _keyed_custom_pool_matches(pool_provider, provider_norm, base_url)
-    if provider_norm == "custom":
+        url_match = _keyed_custom_pool_matches(pool_provider, provider_norm, base_url)
+    elif provider_norm == "custom":
         try:
             matched_pool = get_custom_provider_pool_key(base_url or "")
-            if str(matched_pool or "").strip().lower() == pool_provider:
-                return True
-            candidates = custom_provider_pool_key_candidates(base_url or "")
+            url_match = str(matched_pool or "").strip().lower() == pool_provider or pool_provider in {
+                str(key).strip().lower() for key in custom_provider_pool_key_candidates(base_url or "")
+            }
         except Exception:
             return False
-        return pool_provider in {str(key).strip().lower() for key in candidates}
-
-    runtime_url = _norm_url(base_url)
-    if not runtime_url:
+    else:
+        runtime_url = _norm_url(base_url)
+        if not runtime_url:
+            return False
+        return _legacy_custom_pool_matches(pool_provider, provider_norm, runtime_url)
+    if not owner_key:
+        return url_match
+    try:
+        return _custom_pool_serves_owner_key(pool_or_provider, pool_provider, base_url, owner_key, url_match)
+    except Exception:
         return False
-    return _legacy_custom_pool_matches(pool_provider, provider_norm, runtime_url)
 
 
-def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -> str:
+def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str],
+                             owner_api_key: Any = None) -> str:
     """Resolve the credential-pool key for a runtime provider identity.
 
     Named custom runtimes retain their configured alias while their pool may
@@ -767,16 +912,25 @@ def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -
     ``custom:<name>``. Return that scoped key only when the canonical
     provider/endpoint boundary accepts it; otherwise preserve the normalized
     runtime identity so callers fail closed.
+
+    ``owner_api_key`` (a bare ``custom`` runtime's own key) prefers the pool that key can own over
+    the first pool on the URL, which may be a same-URL sibling's.
     """
     provider_norm = str(provider or "").strip().lower()
     if not provider_norm:
         return ""
+    owner_key = _owner_key(owner_api_key) if provider_norm == "custom" else ""
 
     def _accepts(candidate: str) -> bool:
-        return credential_pool_matches_provider(candidate, provider_norm, base_url=base_url)
+        return credential_pool_matches_provider(
+            candidate, provider_norm, base_url=base_url, owner_api_key=owner_key or None,
+        )
 
     try:
         if provider_norm == "custom":
+            for candidate in custom_pool_keys_for_owner_key(base_url, owner_key):
+                if _accepts(candidate):
+                    return str(candidate).strip().lower()
             candidate = get_custom_provider_pool_key(base_url)
             if candidate and _accepts(candidate):
                 return str(candidate).strip().lower()

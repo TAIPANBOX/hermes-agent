@@ -881,7 +881,8 @@ def recover_with_credential_pool(
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     pool_provider = (getattr(pool, "provider", "") or "").strip().lower()
     if pool_provider and not credential_pool_matches_provider(
-        pool, current_provider, base_url=getattr(agent, "base_url", None)
+        pool, current_provider, base_url=getattr(agent, "base_url", None),
+        owner_api_key=getattr(agent, "api_key", None),
     ):
         # Same fail-closed boundary predicate as runtime binding.
         _ra().logger.warning(
@@ -1140,14 +1141,20 @@ def drop_thinking_only_and_merge_users(
     return merged
 
 
-def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base_url, matches_primary, load_primary_pool):
+def _pool_key_of(pool) -> str:
+    return str(getattr(pool, "provider", "") or "").strip().lower()
+
+
+def _primary_reset_gate_blocks(agent, rt, primary_provider, primary_runtime_base_url, matches_primary, load_primary_pool,
+                               pinned_pool_key=None):
     """Reset-aware gate: skip a guaranteed-to-fail restore while the primary pool reports a
     future reset; fails open on any error/None. Returns ``(blocked, prefetched_pool, prefetched)``
-    so the rebind step reuses the loaded pool (one auth.json read at most)."""
+    so the rebind step reuses the loaded pool (one auth.json read at most). A valid pinned pool
+    (``pinned_pool_key``) is read instead of any other attached pool."""
     prefetched_pool, prefetched = None, False
     try:
         pool = getattr(agent, "_credential_pool", None)
-        if not matches_primary(pool):
+        if (_pool_key_of(pool) != pinned_pool_key) if pinned_pool_key else not matches_primary(pool):
             prefetched_pool = pool = load_primary_pool()
             prefetched = True
         primary_model = str(rt.get("model") or "").strip()
@@ -1176,14 +1183,19 @@ def _restore_runtime_capabilities(agent, rt: Dict[str, Any]) -> None:
         logger.warning("Ignoring malformed runtime capabilities snapshot")
 
 
-def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched) -> None:
+def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched,
+                                    pinned_pool_key=None, primary_base_url=None) -> None:
     """Rebind and re-select the primary credential pool after a fallback turn. A cross-provider
     fallback attaches its own pool, which would trip the provider-mismatch guard on the next
-    401/429: reload the primary pool, else clear it. The snapshot api_key may be stale after
-    rotation; re-select the pool's best entry, keeping the snapshot key when none is usable."""
+    401/429: reload the primary pool, else clear it. A valid pinned pool (``pinned_pool_key``, the
+    pool the primary ran from) replaces any other attached pool, even one that also matches (a
+    same-URL sibling's, after a fallback to it). The snapshot api_key may be stale after rotation;
+    re-select the pool's best entry, keeping the snapshot key when none is usable or when it would
+    move a bare-custom primary off ``primary_base_url``."""
     pool = getattr(agent, "_credential_pool", None)
-    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
-    if pool is not None and pool_provider and not matches_primary(pool):
+    pool_provider = _pool_key_of(pool)
+    if (pool_provider != pinned_pool_key) if pinned_pool_key else (
+            pool is not None and pool_provider and not matches_primary(pool)):
         agent._credential_pool = None
         agent._credential_pool_entry_id = None
         try:
@@ -1198,7 +1210,10 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
     entry = pool.select(model=primary_model or None) if pool is not None and pool.has_available(model=primary_model or None) else None
     if entry is None or not (getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")):
         return
-    if matches_primary(entry):
+    # A bare-custom primary is one endpoint; its pools (plain "custom" above all) can hold rows of
+    # others, whose base_url _swap_credential would adopt. Other providers keep adopting it.
+    serves = primary_provider != "custom" or credential_pool_entry_serves_endpoint(entry, primary_base_url)
+    if matches_primary(entry) and serves:
         # _swap_credential rebuilds the client and reapplies base-url-scoped headers.
         # ``_swap_credential`` rebuilds the OpenAI/Anthropic client, reapplies base-url-scoped headers, and
         # carries the accumulated base_url / OAuth-detection fixes (#33163).
@@ -1209,10 +1224,10 @@ def _rebind_primary_credential_pool(agent, primary_provider, primary_model, matc
         )
     else:
         logger.info(
-            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s",
+            "Restore skipped pool entry %s (%s): provider %s does not match primary provider %s at %s",
             getattr(entry, "id", "?"), getattr(entry, "label", "?"),
             str(getattr(entry, "provider", "") or "").strip().lower() or "?",
-            primary_provider or "?",
+            primary_provider or "?", primary_base_url or "?",
         )
 
 
@@ -1272,18 +1287,35 @@ def restore_primary_runtime(agent) -> bool:
         # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
+    # A bare-custom primary's own key picks its own pool over a same-URL sibling's (whose key the
+    # rebind below would otherwise swap in); no string key keeps the URL-only match.
+    primary_owner_key = (rt or {}).get("api_key")
+    # The pool the primary ran from, while it is still its own: a key a same-URL sibling declares
+    # and the primary's own pool holds as a row would otherwise name the sibling's pool, and a
+    # fallback to that sibling leaves its (also matching) pool attached. Bare custom only.
+    from agent.credential_pool import custom_pool_pin_serves_primary
+    pinned_pool_key = str((rt or {}).get("credential_pool_key") or "").strip().lower() or None
+    if pinned_pool_key and not custom_pool_pin_serves_primary(
+            pinned_pool_key, primary_provider, primary_runtime_base_url, primary_owner_key):
+        pinned_pool_key = None
 
     def _matches_primary(candidate) -> bool:
-        return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
+        if pinned_pool_key and _pool_key_of(candidate) == pinned_pool_key:
+            return True
+        return credential_pool_matches_provider(
+            candidate, primary_provider, base_url=primary_runtime_base_url, owner_api_key=primary_owner_key,
+        )
 
     def _load_primary_pool():
-        """Load the primary provider's pool; None when absent or provider-mismatched."""
+        """Load the primary provider's pool (the pinned one when valid, else the owner-key
+        lookup); None when absent or provider-mismatched."""
         from agent.credential_pool import load_pool
-        key = resolve_runtime_pool_key(primary_provider, primary_runtime_base_url)
+        key = pinned_pool_key or resolve_runtime_pool_key(
+            primary_provider, primary_runtime_base_url, owner_api_key=primary_owner_key)
         loaded = load_pool(key) if key else None
         return loaded if loaded is not None and _matches_primary(loaded) else None
     blocked, prefetched_pool, prefetched = _primary_reset_gate_blocks(
-        agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool
+        agent, rt, primary_provider, primary_runtime_base_url, _matches_primary, _load_primary_pool, pinned_pool_key,
     )
     if blocked:
         return False
@@ -1317,7 +1349,8 @@ def restore_primary_runtime(agent) -> bool:
             from agent.conversation_compression import revalidate_compression_feasibility
             revalidate_compression_feasibility(agent)
         _rebind_primary_credential_pool(
-            agent, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched
+            agent, primary_provider, primary_model, _matches_primary, _load_primary_pool, prefetched_pool, prefetched,
+            pinned_pool_key, primary_runtime_base_url,
         )
         # Older snapshots have no reasoning_config; keep the current value.
         saved_reasoning = rt.get("reasoning_config")
@@ -2231,6 +2264,12 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     revalidate_compression_feasibility(agent)
 
 
+def primary_credential_pool_key(agent) -> Optional[str]:
+    """The ``provider`` key of the pool ``agent`` runs from, or None when it has no scoped pool."""
+    pool_key = getattr(getattr(agent, "_credential_pool", None), "provider", None)
+    return (pool_key.strip().lower() or None) if isinstance(pool_key, str) else None
+
+
 def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
     """The ``_primary_runtime`` record that persists a switch across turns."""
     cc = getattr(agent, "context_compressor", None) or None
@@ -2241,6 +2280,7 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "credential_pool_key": primary_credential_pool_key(agent),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

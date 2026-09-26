@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
-from agent.agent_runtime_helpers import _ra
+from agent.agent_runtime_helpers import _ra, primary_credential_pool_key
 from agent.iteration_budget import IterationBudget, normalize_budget_warning_ratio
 from agent.memory_manager import StreamingContextScrubber
 from agent.memory_provider import is_core_memory_provider
@@ -422,7 +422,7 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
         agent.api_mode = _mandated if _mandated is not None else "chat_completions"
 
 
-def _finalize_routing(agent, api_mode, credential_pool):
+def _finalize_routing(agent, api_mode, credential_pool, api_key=None):
     from hermes_cli.providers import is_actual_route
     # Credential-pool validation runs AFTER provider auto-detection so a pool scoped to
     # "anthropic" isn't rejected for provider=None + anthropic.com URL.
@@ -431,8 +431,11 @@ def _finalize_routing(agent, api_mode, credential_pool):
     if credential_pool is not None:
         try:
             from agent.credential_pool import credential_pool_matches_provider
+            # The runtime's own key keeps a bare-custom model's own pool when a same-URL
+            # sibling is listed first (the URL-only match names the sibling's pool).
             if not credential_pool_matches_provider(
                 credential_pool, agent.provider, base_url=agent.base_url,
+                owner_api_key=api_key,
             ):
                 agent._credential_pool = None
         except Exception:
@@ -2256,6 +2259,9 @@ def _snapshot_primary_runtime(agent):
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        # The pool the primary runs from: restore rebinds to it while it still owns the key, since
+        # a key alone cannot tell a same-URL sibling that declares it from the pool holding it.
+        "credential_pool_key": primary_credential_pool_key(agent),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
@@ -2420,7 +2426,7 @@ def init_agent(
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
-    _finalize_routing(agent, api_mode, credential_pool)
+    _finalize_routing(agent, api_mode, credential_pool, api_key)
 
     # Platform callbacks are stored under their parameter names verbatim.
     for _cb in _CALLBACK_PARAMS:

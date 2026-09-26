@@ -494,7 +494,10 @@ def _resolve_direct_alias_runtime(requested_provider: str, explicit_api_key: Opt
     base_url = explicit_base_url.strip().rstrip("/")
     # Pool first — mirrors the named-custom path so bare `provider: custom` with a configured
     # custom_providers entry gets its api_key from the pool instead of env fallbacks.
-    pool_result = rp._try_resolve_from_custom_pool(base_url, "custom", None)
+    # An explicit key owns the lookup, so a same-URL named sibling's pool (and key) is skipped;
+    # without one it stays URL-only.
+    pool_result = rp._try_resolve_from_custom_pool(base_url, "custom", None,
+                                                   owner_api_key=(explicit_api_key or "").strip() or None)
     if pool_result:
         pool_result["source"] = "direct-alias"
         return pool_result
